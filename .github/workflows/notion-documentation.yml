@@ -1,0 +1,21 @@
+name: Notion documentation
+
+on:
+  push:
+    paths:
+      - 'docs/notion/**'
+      - '.github/workflows/notion-documentation.yml'
+  pull_request:
+    paths:
+      - 'docs/notion/**'
+      - '.github/workflows/notion-documentation.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  documentation:
+    uses: sujungwin8-cpu/notion-project-sync/.github/workflows/publish.yml@v1
+    secrets:
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}

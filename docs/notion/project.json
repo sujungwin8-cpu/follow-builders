@@ -1,0 +1,14 @@
+{
+  "schema_version": 2,
+  "project_id": "follow-builders",
+  "name": "follow-builders",
+  "kind": "software",
+  "notion_page_id": "3e52127e-4d3c-8105-8ae5-f5eac11a55e1",
+  "github_repository": "sujungwin8-cpu/follow-builders",
+  "source_paths": [
+    "."
+  ],
+  "current_file": "current.md",
+  "history_dir": "history",
+  "manual_file": "manual.md"
+}
