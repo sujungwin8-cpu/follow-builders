@@ -2,6 +2,14 @@
 
 # Follow Builders, Not Influencers
 
+> **Running this fork's collector:** the scheduled workflow collects public blogs
+> without API keys and skips X/podcasts when their credentials are missing.
+> Read [the collector guide](docs/notion/manual.md) for Secrets, run modes,
+> and `feed-status.json`. The upstream consumer instructions below (including
+> “no API keys needed”) describe reading upstream feeds, not operating a collector.
+> `prepare-digest.js` still reads `zarazhangrui/follow-builders`; it does not read
+> this fork's generated files or send a ChatGPT briefing.
+
 An AI-powered digest that tracks the top builders in AI — researchers, founders, PMs,
 and engineers who are actually building things — and delivers curated summaries of
 what they're saying.

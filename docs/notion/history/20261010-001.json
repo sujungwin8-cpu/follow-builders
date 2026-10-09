@@ -1,0 +1,8 @@
+{
+  "id": "20261010-001",
+  "date": "2026-10-10",
+  "title": "API 키 미설정 시 블로그 수집 유지 및 상태 분리",
+  "version": "c0576b64eea2 기반 feed-credential-fallback",
+  "deployment_status": "로컬 시험 20개 통과; GitHub 수정본 실행·노션 게시 확인 기록 없음",
+  "source_archive": "https://github.com/sujungwin8-cpu/follow-builders/commit/c0576b64eea22e1c38d0b9ace725aa37001dae71"
+}

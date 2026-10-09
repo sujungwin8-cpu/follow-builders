@@ -10,10 +10,11 @@
 // URLs in state-feed.json so content is never repeated across runs.
 //
 // Usage: node generate-feed.js [--tweets-only | --podcasts-only | --blogs-only]
-// Env vars needed: X_BEARER_TOKEN, POD2TXT_API_KEY
+// Optional in default mode: X_BEARER_TOKEN, POD2TXT_API_KEY.
+// Explicit --tweets-only / --podcasts-only modes require their respective key.
 // ============================================================================
 
-import { readFile, writeFile } from "fs/promises";
+import { readFile, writeFile, appendFile } from "fs/promises";
 import { existsSync } from "fs";
 import { join } from "path";
 
@@ -57,17 +58,13 @@ async function loadState() {
   }
 }
 
-async function saveState(state) {
+async function saveState(state, updatedKeys) {
   // Prune entries older than 7 days to prevent the file from growing forever
   const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
-  for (const [id, ts] of Object.entries(state.seenTweets)) {
-    if (ts < cutoff) delete state.seenTweets[id];
-  }
-  for (const [id, ts] of Object.entries(state.seenVideos)) {
-    if (ts < cutoff) delete state.seenVideos[id];
-  }
-  for (const [id, ts] of Object.entries(state.seenArticles || {})) {
-    if (ts < cutoff) delete state.seenArticles[id];
+  for (const key of updatedKeys) {
+    for (const [id, ts] of Object.entries(state[key] || {})) {
+      if (ts < cutoff) delete state[key][id];
+    }
   }
   await writeFile(STATE_PATH, JSON.stringify(state, null, 2));
 }
@@ -336,18 +333,18 @@ async function fetchPod2txtTranscript(rssUrl, guid, apiKey) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ feedurl: rssUrl, guid, apikey: apiKey }),
+      signal: AbortSignal.timeout(30000),
     });
 
     if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      return { error: `HTTP ${res.status}: ${text}` };
+      return { error: `HTTP ${res.status}` };
     }
 
     const data = await res.json();
 
     if (data.status === "ready" && data.url) {
       // Transcript is ready — fetch the text from the provided URL
-      const txtRes = await fetch(data.url);
+      const txtRes = await fetch(data.url, { signal: AbortSignal.timeout(30000) });
       if (!txtRes.ok)
         return {
           error: `Failed to fetch transcript text: HTTP ${txtRes.status}`,
@@ -465,9 +462,6 @@ async function fetchPodcastContent(podcasts, apiKey, state, errors) {
       apiKey,
     );
 
-    // Mark as seen regardless so we don't retry failed episodes daily
-    state.seenVideos[selected.guid] = Date.now();
-
     if (result.error) {
       console.error(
         `    Transcript error: ${result.error} — skipping to next candidate`,
@@ -479,11 +473,12 @@ async function fetchPodcastContent(podcasts, apiKey, state, errors) {
     }
 
     if (!result.transcript) {
-      console.error(
-        `    Empty transcript for "${selected.title}" — skipping to next candidate`,
-      );
+      errors.push(`Podcast: Empty transcript for "${selected.title}"`);
       continue;
     }
+
+    // Failed transcripts remain retryable; only delivered content is deduplicated.
+    state.seenVideos[selected.guid] = Date.now();
 
     console.error(
       `    Selected: "${selected.title}" (transcript: ${result.transcript.length} chars)`,
@@ -531,7 +526,7 @@ async function fetchXWithRetry(url, options) {
   let lastResponse;
   for (let attempt = 1; attempt <= X_RETRY_ATTEMPTS; attempt++) {
     try {
-      const res = await fetch(url, options);
+      const res = await fetch(url, { ...options, signal: AbortSignal.timeout(30000) });
       lastResponse = res;
       if (!X_RETRY_STATUSES.has(res.status) || attempt === X_RETRY_ATTEMPTS) {
         return res;
@@ -714,16 +709,14 @@ function parseAnthropicEngineeringIndex(html) {
   return articles;
 }
 
-// Scrapes the Claude Blog index page (claude.com/blog).
-// This is a Webflow site. We extract article links, titles, and dates
-// from the HTML structure.
+// Supports both the legacy /blog index and the current /resources/articles site.
 function parseClaudeBlogIndex(html) {
   const articles = [];
   const seenSlugs = new Set();
 
   // Match blog post links — they follow the pattern /blog/<slug>
   // We capture surrounding context to extract titles and dates
-  const linkRegex = /href="\/blog\/([a-z0-9-]+)"/gi;
+  const linkRegex = /href=["'](?:https:\/\/claude\.com)?(\/(?:blog|resources\/articles)\/[a-z0-9-]+)\/?["']/gi;
   let linkMatch;
   while ((linkMatch = linkRegex.exec(html)) !== null) {
     const slug = linkMatch[1];
@@ -731,7 +724,7 @@ function parseClaudeBlogIndex(html) {
     seenSlugs.add(slug);
     articles.push({
       title: "", // Will be filled when we fetch the article page
-      url: `https://claude.com/blog/${slug}`,
+      url: `https://claude.com${slug}`,
       publishedAt: null,
       description: "",
     });
@@ -820,8 +813,10 @@ function extractClaudeBlogArticleContent(html) {
   let jsonLdMatch;
   while ((jsonLdMatch = jsonLdRegex.exec(html)) !== null) {
     try {
-      const ld = JSON.parse(jsonLdMatch[1]);
-      if (ld["@type"] === "BlogPosting" || ld["@type"] === "Article") {
+      const parsed = JSON.parse(jsonLdMatch[1]);
+      const entries = Array.isArray(parsed) ? parsed : parsed["@graph"] || [parsed];
+      const ld = entries.find((entry) => [entry["@type"]].flat().some((type) => type === "BlogPosting" || type === "Article"));
+      if (ld) {
         title = ld.headline || ld.name || "";
         author = ld.author?.name || "";
         publishedAt = ld.datePublished || null;
@@ -832,8 +827,10 @@ function extractClaudeBlogArticleContent(html) {
     }
   }
 
-  // Extract body text from the Webflow rich text container
+  // Prefer the complete article. A non-greedy div match truncates modern
+  // articles at embedded media/nested divs after the first paragraph.
   const richTextMatch =
+    html.match(/<article\b[^>]*>([\s\S]*?)<\/article>/i) ||
     html.match(
       /<div[^>]*class="[^"]*u-rich-text-blog[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/i,
     ) ||
@@ -862,8 +859,9 @@ function extractClaudeBlogArticleContent(html) {
       if (h1Match) title = h1Match[1].replace(/<[^>]+>/g, "").trim();
     }
 
-    // Strip the whole page down to text as a last resort
-    content = html
+    // The current site renders the body inside <article>; exclude site navigation.
+    const articleHtml = html.match(/<article\b[^>]*>([\s\S]*?)<\/article>/i)?.[1] || html;
+    content = articleHtml
       .replace(/<script[\s\S]*?<\/script>/gi, "")
       .replace(/<style[\s\S]*?<\/style>/gi, "")
       .replace(/<nav[\s\S]*?<\/nav>/gi, "")
@@ -899,6 +897,7 @@ async function fetchBlogContent(blogs, state, errors) {
       // Step 1: Discover articles from the blog index page
       const indexRes = await fetch(blog.indexUrl, {
         headers: { "User-Agent": "FollowBuilders/1.0 (feed aggregator)" },
+        signal: AbortSignal.timeout(30000),
       });
       if (!indexRes.ok) {
         errors.push(
@@ -913,6 +912,11 @@ async function fetchBlogContent(blogs, state, errors) {
         candidates = parseAnthropicEngineeringIndex(indexHtml);
       } else if (blog.indexUrl.includes("claude.com")) {
         candidates = parseClaudeBlogIndex(indexHtml);
+      }
+
+      if (candidates.length === 0) {
+        errors.push(`Blog: No article links parsed for ${blog.name}; check source layout`);
+        continue;
       }
 
       // Step 2: Filter to unseen articles, cap at MAX_ARTICLES_PER_BLOG.
@@ -947,6 +951,7 @@ async function fetchBlogContent(blogs, state, errors) {
           // Fetch the full article page
           const articleRes = await fetch(article.url, {
             headers: { "User-Agent": "FollowBuilders/1.0 (feed aggregator)" },
+            signal: AbortSignal.timeout(30000),
           });
           if (!articleRes.ok) {
             errors.push(
@@ -960,7 +965,7 @@ async function fetchBlogContent(blogs, state, errors) {
           let extracted;
           if (article.url.includes("anthropic.com/engineering")) {
             extracted = extractAnthropicArticleContent(articleHtml);
-          } else if (article.url.includes("claude.com/blog")) {
+          } else if (new URL(article.url).hostname === "claude.com") {
             extracted = extractClaudeBlogArticleContent(articleHtml);
           }
 
@@ -969,13 +974,17 @@ async function fetchBlogContent(blogs, state, errors) {
             continue;
           }
 
+          // Dates may only be available on the article page (current Claude site).
+          const publishedAt = extracted.publishedAt || article.publishedAt || null;
+          if (publishedAt && new Date(publishedAt) < cutoff) continue;
+
           // Merge extracted data with what we already have from the index
           results.push({
             source: "blog",
             name: blog.name,
             title: extracted.title || article.title || "Untitled",
             url: article.url,
-            publishedAt: extracted.publishedAt || article.publishedAt || null,
+            publishedAt,
             author: extracted.author || "",
             description: article.description || "",
             content: extracted.content,
@@ -1004,123 +1013,108 @@ async function fetchBlogContent(blogs, state, errors) {
 
 async function main() {
   const args = process.argv.slice(2);
-  const tweetsOnly = args.includes("--tweets-only");
-  const podcastsOnly = args.includes("--podcasts-only");
-  const blogsOnly = args.includes("--blogs-only");
-
-  // If a specific --*-only flag is set, only that feed type runs.
-  // If no flag is set, all three run.
-  const runTweets = tweetsOnly || (!podcastsOnly && !blogsOnly);
-  const runPodcasts = podcastsOnly || (!tweetsOnly && !blogsOnly);
-  const runBlogs = blogsOnly || (!tweetsOnly && !podcastsOnly);
-
-  const xBearerToken = process.env.X_BEARER_TOKEN;
-  const pod2txtKey = process.env.POD2TXT_API_KEY;
-
-  if (runPodcasts && !pod2txtKey) {
-    console.error("POD2TXT_API_KEY not set");
-    process.exit(1);
+  const modes = new Map([
+    ["--tweets-only", "x"],
+    ["--podcasts-only", "podcasts"],
+    ["--blogs-only", "blogs"],
+  ]);
+  if (args.length > 1 || (args.length === 1 && !modes.has(args[0]))) {
+    throw new Error("Usage: node generate-feed.js [--tweets-only | --podcasts-only | --blogs-only]");
   }
-  if (runTweets && !xBearerToken) {
-    console.error("X_BEARER_TOKEN not set");
-    process.exit(1);
-  }
+  const mode = modes.get(args[0]) || "all";
+  const xBearerToken = process.env.X_BEARER_TOKEN?.trim();
+  const pod2txtKey = process.env.POD2TXT_API_KEY?.trim();
+  // An explicit request must never silently succeed without its credentials.
+  if (mode === "x" && !xBearerToken) throw new Error("X_BEARER_TOKEN not set");
+  if (mode === "podcasts" && !pod2txtKey) throw new Error("POD2TXT_API_KEY not set");
 
   const sources = await loadSources();
   const state = await loadState();
-  const errors = [];
+  const updatedKeys = [];
+  const report = { generatedAt: new Date().toISOString(), mode, feeds: {} };
+  const definitions = [
+    { name: "blogs", sources: sources.blogs, stateKey: "seenArticles",
+      lookbackHours: BLOG_LOOKBACK_HOURS, fetch: (draft, errors) => fetchBlogContent(sources.blogs, draft, errors),
+      stats: (items) => ({ blogPosts: items.length }) },
+    { name: "x", sources: sources.x_accounts, stateKey: "seenTweets", key: xBearerToken, keyName: "X_BEARER_TOKEN",
+      lookbackHours: TWEET_LOOKBACK_HOURS, fetch: (draft, errors) => fetchXContent(sources.x_accounts, xBearerToken, draft, errors),
+      stats: (items) => ({ xBuilders: items.length, totalTweets: items.reduce((sum, a) => sum + a.tweets.length, 0) }) },
+    { name: "podcasts", sources: sources.podcasts, stateKey: "seenVideos", key: pod2txtKey, keyName: "POD2TXT_API_KEY",
+      lookbackHours: PODCAST_LOOKBACK_HOURS, fetch: (draft, errors) => fetchPodcastContent(sources.podcasts, pod2txtKey, draft, errors),
+      stats: (items) => ({ podcastEpisodes: items.length }) },
+  ];
 
-  // Fetch tweets
-  if (runTweets) {
-    console.error("Fetching X/Twitter content...");
-    const xContent = await fetchXContent(
-      sources.x_accounts,
-      xBearerToken,
-      state,
-      errors,
-    );
-    console.error(`  Found ${xContent.length} builders with new tweets`);
+  for (const definition of definitions) {
+    const { name, stateKey } = definition;
+    const feedPath = join(SCRIPT_DIR, "..", `feed-${name}.json`);
+    const status = { status: "skipped", feedUpdated: false, feedGeneratedAt: null };
+    report.feeds[name] = status;
+    try {
+      status.feedGeneratedAt = JSON.parse(await readFile(feedPath, "utf-8")).generatedAt || null;
+    } catch { /* No previous usable feed. */ }
+    if (mode !== "all" && mode !== name) {
+      status.reason = "not_requested";
+      continue;
+    }
+    if (definition.keyName && !definition.key) {
+      status.reason = `${definition.keyName} not set`;
+      console.error(`Skipping ${name}: ${status.reason}; previous feed preserved`);
+      continue;
+    }
+    if (!definition.sources?.length) {
+      status.status = "failed";
+      status.reason = "No sources configured";
+      continue;
+    }
 
-    const totalTweets = xContent.reduce((sum, a) => sum + a.tweets.length, 0);
-    const xFeed = {
-      generatedAt: new Date().toISOString(),
-      lookbackHours: TWEET_LOOKBACK_HOURS,
-      x: xContent,
-      stats: { xBuilders: xContent.length, totalTweets },
-      errors:
-        errors.filter((e) => e.startsWith("X API")).length > 0
-          ? errors.filter((e) => e.startsWith("X API"))
-          : undefined,
-    };
-    await writeFile(
-      join(SCRIPT_DIR, "..", "feed-x.json"),
-      JSON.stringify(xFeed, null, 2),
-    );
-    console.error(
-      `  feed-x.json: ${xContent.length} builders, ${totalTweets} tweets`,
-    );
+    // A collector failure must not prevent another feed from being collected.
+    // Only merge dedup state after successfully writing that collector's output.
+    const draft = structuredClone(state);
+    const errors = [];
+    try {
+      console.error(`Fetching ${name} content...`);
+      const items = await definition.fetch(draft, errors);
+      if (items.length === 0 && errors.length > 0) {
+        status.status = "failed";
+      } else {
+        const generatedAt = new Date().toISOString();
+        await writeFile(feedPath, JSON.stringify({
+          generatedAt, lookbackHours: definition.lookbackHours,
+          [name]: items, stats: definition.stats(items),
+          errors: errors.length ? errors : undefined,
+        }, null, 2));
+        state[stateKey] = draft[stateKey];
+        updatedKeys.push(stateKey);
+        Object.assign(status, {
+          status: errors.length ? "partial" : "success",
+          feedUpdated: true, feedGeneratedAt: generatedAt, stats: definition.stats(items),
+        });
+      }
+    } catch (err) {
+      status.status = "failed";
+      errors.push(err.message);
+    }
+    if (errors.length) status.errors = errors;
+    console.error(`${name}: ${status.status}${status.feedUpdated ? "" : " (previous feed preserved)"}`);
+    for (const error of errors) console.error(`  ${error}`);
   }
 
-  // Fetch podcasts
-  if (runPodcasts) {
-    console.error("Fetching podcast content (RSS + pod2txt)...");
-    const podcasts = await fetchPodcastContent(
-      sources.podcasts,
-      pod2txtKey,
-      state,
-      errors,
+  if (updatedKeys.length) await saveState(state, updatedKeys);
+  const statuses = Object.values(report.feeds);
+  const failed = statuses.some((s) => s.status === "failed") || updatedKeys.length === 0;
+  report.status = failed ? "failed" : statuses.some((s) => s.status === "partial") ? "partial" : "success";
+  await writeFile(join(SCRIPT_DIR, "..", "feed-status.json"), JSON.stringify(report, null, 2));
+  if (process.env.GITHUB_STEP_SUMMARY) {
+    const rows = Object.entries(report.feeds).map(([name, s]) =>
+      `| ${name} | ${s.status} | ${s.feedUpdated ? "yes" : "no"} | ${s.reason || (s.errors?.length ? `${s.errors.length} collection error(s); see logs` : "—")} |`
     );
-    console.error(`  Found ${podcasts.length} new episodes`);
-
-    const podcastFeed = {
-      generatedAt: new Date().toISOString(),
-      lookbackHours: PODCAST_LOOKBACK_HOURS,
-      podcasts,
-      stats: { podcastEpisodes: podcasts.length },
-      errors:
-        errors.filter((e) => e.startsWith("Podcast")).length > 0
-          ? errors.filter((e) => e.startsWith("Podcast"))
-          : undefined,
-    };
-    await writeFile(
-      join(SCRIPT_DIR, "..", "feed-podcasts.json"),
-      JSON.stringify(podcastFeed, null, 2),
-    );
-    console.error(`  feed-podcasts.json: ${podcasts.length} episodes`);
+    await appendFile(process.env.GITHUB_STEP_SUMMARY,
+      `## Feed collection: ${report.status}\n\n| Feed | Status | Updated | Detail |\n| --- | --- | --- | --- |\n${rows.join("\n")}\n\nSkipped/failed feeds retain their original generatedAt; they are not fresh collection results.\n`);
   }
-
-  // Fetch blog posts
-  if (runBlogs && sources.blogs && sources.blogs.length > 0) {
-    console.error("Fetching blog content...");
-    const blogContent = await fetchBlogContent(sources.blogs, state, errors);
-    console.error(`  Found ${blogContent.length} new blog post(s)`);
-
-    const blogFeed = {
-      generatedAt: new Date().toISOString(),
-      lookbackHours: BLOG_LOOKBACK_HOURS,
-      blogs: blogContent,
-      stats: { blogPosts: blogContent.length },
-      errors:
-        errors.filter((e) => e.startsWith("Blog")).length > 0
-          ? errors.filter((e) => e.startsWith("Blog"))
-          : undefined,
-    };
-    await writeFile(
-      join(SCRIPT_DIR, "..", "feed-blogs.json"),
-      JSON.stringify(blogFeed, null, 2),
-    );
-    console.error(`  feed-blogs.json: ${blogContent.length} posts`);
-  }
-
-  // Save dedup state
-  await saveState(state);
-
-  if (errors.length > 0) {
-    console.error(`  ${errors.length} non-fatal errors`);
-  }
+  if (failed) process.exitCode = 1;
 }
 
 main().catch((err) => {
   console.error("Feed generation failed:", err.message);
-  process.exit(1);
+  process.exitCode = 1;
 });

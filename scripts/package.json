@@ -4,6 +4,7 @@
   "description": "Scripts for Follow Builders skill — feed generation, digest preparation, delivery",
   "type": "module",
   "scripts": {
+    "test": "node --test test/*.test.js",
     "generate-feed": "node generate-feed.js",
     "prepare-digest": "node prepare-digest.js"
   },
