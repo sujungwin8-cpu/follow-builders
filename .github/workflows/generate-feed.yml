@@ -1,13 +1,26 @@
 name: Generate Feeds
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/generate-feed.js'
+      - 'scripts/test/**'
+      - 'scripts/package*.json'
+      - 'config/default-sources.json'
+      - '.github/workflows/generate-feed.yml'
+  pull_request:
+    paths:
+      - 'scripts/**'
+      - 'config/default-sources.json'
+      - '.github/workflows/generate-feed.yml'
   schedule:
-    # All feeds (tweets, podcasts, blogs): once daily at 6:17am UTC
+    # Available feeds: 06:17 UTC / 15:17 Asia/Seoul. GitHub may delay scheduled runs.
     - cron: '17 6 * * *'
   workflow_dispatch:
     inputs:
       mode:
-        description: 'What to fetch'
+        description: 'all = blogs + credentialed feeds; an explicit mode requires its key'
         required: false
         default: 'all'
         type: choice
@@ -17,9 +30,29 @@ on:
           - podcasts-only
           - blogs-only
 
+concurrency:
+  group: generate-feeds-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  generate:
+  test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Test collector without external services
+        working-directory: scripts
+        run: npm test
+
+  generate:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write
 
@@ -31,23 +64,34 @@ jobs:
           node-version: '20'
 
       - name: Install dependencies
-        run: cd scripts && npm install
+        run: cd scripts && npm ci
 
       - name: Generate feeds
+        id: collect
+        continue-on-error: true
         env:
           X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
           POD2TXT_API_KEY: ${{ secrets.POD2TXT_API_KEY }}
+          FEED_MODE: ${{ inputs.mode || 'all' }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.mode }}" != "all" ]; then
-            cd scripts && node generate-feed.js --${{ inputs.mode }}
-          else
-            cd scripts && node generate-feed.js
-          fi
+          cd scripts
+          case "$FEED_MODE" in
+            all) node generate-feed.js ;;
+            tweets-only|podcasts-only|blogs-only) node generate-feed.js "--$FEED_MODE" ;;
+            *) echo "Invalid feed mode" >&2; exit 1 ;;
+          esac
 
       - name: Commit and push feeds
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add feed-x.json feed-podcasts.json feed-blogs.json state-feed.json
+          if [ -f feed-status.json ]; then git add feed-status.json; fi
           git diff --cached --quiet || git commit -m "chore: update feeds [skip ci]"
           git push
+
+      # Save successful feeds and diagnostics even when a different collector failed.
+      # The run itself must still show failure, rather than masking an outage.
+      - name: Report collection failure
+        if: steps.collect.outcome == 'failure'
+        run: exit 1
